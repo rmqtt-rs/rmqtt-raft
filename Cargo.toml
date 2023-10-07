@@ -1,6 +1,6 @@
 [package]
 name = "rmqtt-raft"
-version = "0.3.3"
+version = "0.4.0"
 authors = ["rmqtt <rmqttd@126.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -27,7 +27,6 @@ tikv-raft = { package = "raft", version = "0.7", features = [
 tokio = { version = "1", default-features = false }
 socket2 = { version = "0.5", features = ["all"], optional = true }
 tokio-stream = { version = "0.1", features = ["net"], optional = true }
-tonic = "0.9"
 prost = "0.11"
 futures = "0.3"
 async-trait = "0.1"
@@ -41,6 +40,10 @@ ahash = "0.8"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
 once_cell = "1"
+parking_lot = "0.12"
+rust-box = { path = "../../try-box/rust-box", features = ["handy-grpc", "mpsc", "collections"] }
+#rust-box = { version = "0.9", features = ["handy-grpc", "mpsc", "collections"] }
+
 
 [build-dependencies]
-tonic-build = "0.9"
+

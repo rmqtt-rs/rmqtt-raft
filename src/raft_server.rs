@@ -4,33 +4,41 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bincode::serialize;
-use futures::channel::{mpsc, oneshot};
-use futures::SinkExt;
+use futures::channel::oneshot;
+use futures::{SinkExt, StreamExt};
+
 use log::{info, warn};
 use once_cell::sync::Lazy;
 use prost::Message as _;
-use tikv_raft::eraftpb::{ConfChange, Message as RaftMessage};
+use tikv_raft::eraftpb::{self, ConfChange};
 use tokio::time::timeout;
-use tonic::transport::Server;
-use tonic::{Request, Response, Status};
 
-use crate::message::{Message, RaftResponse};
-use crate::raft_service::raft_service_server::{RaftService, RaftServiceServer};
-use crate::raft_service::{
-    self, ConfChange as RiteraftConfChange, Empty, Message as RiteraftMessage,
-};
-use crate::{error, Config};
+use rust_box::collections::PriorityQueue;
+use rust_box::handy_grpc::server::{run as grpc_run, Message as GrpcMessage};
+use rust_box::handy_grpc::transferpb;
+use rust_box::handy_grpc::Priority;
+use rust_box::mpsc::with_priority_channel;
 
+use super::message::PriorityQueueType;
+use super::message::RaftMessage;
+use super::message::{Message, RaftResponse};
+use super::message::{Receiver, Sender};
+use super::{error, Config};
+
+#[derive(Clone)]
 pub struct RaftServer {
-    snd: mpsc::Sender<Message>,
+    channel_queue: PriorityQueueType<Priority, GrpcMessage>,
+    snd: Sender<(Priority, Message)>,
     laddr: SocketAddr,
     timeout: Duration,
     cfg: Arc<Config>,
 }
 
 impl RaftServer {
-    pub fn new(snd: mpsc::Sender<Message>, laddr: SocketAddr, cfg: Arc<Config>) -> Self {
+    pub fn new(snd: Sender<(Priority, Message)>, laddr: SocketAddr, cfg: Arc<Config>) -> Self {
+        let channel_queue = Arc::new(parking_lot::RwLock::new(PriorityQueue::default()));
         RaftServer {
+            channel_queue,
             snd,
             laddr,
             timeout: cfg.grpc_timeout,
@@ -38,196 +46,266 @@ impl RaftServer {
         }
     }
 
-    pub async fn run(self) -> error::Result<()> {
+    #[inline]
+    pub fn channel_queue_len(&self) -> usize {
+        self.channel_queue.read().len()
+    }
+
+    pub async fn run(&self) -> error::Result<()> {
         let laddr = self.laddr;
         let _cfg = self.cfg.clone();
         info!("listening gRPC requests on: {}", laddr);
-        let svc = RaftServiceServer::new(self);
-        let server = Server::builder().add_service(svc);
 
-        #[cfg(any(feature = "reuseport", feature = "reuseaddr"))]
-        #[cfg(all(feature = "socket2", feature = "tokio-stream"))]
-        {
-            log::info!(
-                "reuseaddr: {}, reuseport: {}",
-                _cfg.reuseaddr,
-                _cfg.reuseport
-            );
-            let listener = raft_service::bind(laddr, 1024, _cfg.reuseaddr, _cfg.reuseport)?;
-            server.serve_with_incoming(listener).await?;
-        }
-        #[cfg(not(any(feature = "reuseport", feature = "reuseaddr")))]
-        server.serve(laddr).await?;
+        let (tx, mut rx) =
+            with_priority_channel::<Priority, GrpcMessage>(self.channel_queue.clone(), 10_000);
 
-        info!("server has quit");
+        let run_receiver_fut = async move {
+            loop {
+                if let Err(e) = grpc_run(laddr, tx.clone(), None, None).await {
+                    log::error!("Run gRPC receiver error, {:?}", e);
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        };
+
+        let recv_data_fut = async move {
+            while let Some((p, (msg, reply_tx))) = rx.next().await {
+                let this = self.clone();
+                tokio::spawn(async move {
+                    match RaftMessage::decode(msg.data.as_slice()) {
+                        Err(e) => {
+                            log::error!("RaftMessage decode error, {:?}", e);
+                            if let Some(reply_tx) = reply_tx {
+                                if let Err(e) = reply_tx.send(Err(e)) {
+                                    log::error!("gRPC send result failure, {:?}", e);
+                                }
+                            }
+                        }
+                        Ok(RaftMessage::IsLeader) => {
+                            if let Some(reply_tx) = reply_tx {
+                                this._request_leader_info(reply_tx).await;
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        Ok(RaftMessage::ConfigChange { change }) => {
+                            if let Some(reply_tx) = reply_tx {
+                                this._change_config(change, reply_tx).await;
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        Ok(RaftMessage::Raft { msg }) => {
+                            this._send_raft_message(msg).await;
+                        }
+                        Ok(RaftMessage::Propose { proposal }) => {
+                            if let Some(reply_tx) = reply_tx {
+                                this._send_proposal(proposal, p, reply_tx).await;
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        Ok(RaftMessage::Query { query }) => {
+                            if let Some(reply_tx) = reply_tx {
+                                this._send_query(query, p, reply_tx).await;
+                            } else {
+                                unreachable!()
+                            }
+                        }
+                        Ok(RaftMessage::Status) => {
+                            unreachable!()
+                        }
+                        Ok(RaftMessage::ReportUnreachable { node_id }) => {
+                            unreachable!()
+                        }
+                    }
+                });
+            }
+            log::error!("Recv None");
+        };
+
+        futures::future::join(recv_data_fut, run_receiver_fut).await;
         Ok(())
     }
-}
 
-#[tonic::async_trait]
-impl RaftService for RaftServer {
-    async fn request_id(
+    #[inline]
+    async fn _request_leader_info(
         &self,
-        _: Request<Empty>,
-    ) -> Result<Response<raft_service::IdRequestReponse>, Status> {
-        let mut sender = self.snd.clone();
+        reply_tx: oneshot::Sender<anyhow::Result<transferpb::Message>>,
+    ) {
         let (tx, rx) = oneshot::channel();
-        let _ = sender.send(Message::RequestId { chan: tx }).await;
-        //let response = rx.await;
-        let reply = timeout(self.timeout, rx)
+        let res = if let Err(e) = self
+            .snd
+            .clone()
+            .send((Priority::MIN, Message::IsLeader { chan: tx }))
             .await
-            .map_err(|_e| Status::unavailable("recv timeout for reply"))?
-            .map_err(|_e| Status::unavailable("recv canceled for reply"))?;
-        match reply {
-            RaftResponse::WrongLeader {
-                leader_id,
-                leader_addr,
-            } => {
-                warn!("sending wrong leader");
-                Ok(Response::new(raft_service::IdRequestReponse {
-                    code: raft_service::ResultCode::WrongLeader as i32,
-                    data: serialize(&(leader_id, leader_addr)).unwrap(),
-                }))
-            }
-            RaftResponse::RequestId { leader_id } => {
-                Ok(Response::new(raft_service::IdRequestReponse {
-                    code: raft_service::ResultCode::Ok as i32,
-                    data: serialize(&leader_id).unwrap(),
-                }))
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    async fn change_config(
-        &self,
-        req: Request<RiteraftConfChange>,
-    ) -> Result<Response<raft_service::RaftResponse>, Status> {
-        let change = ConfChange::decode(req.into_inner().inner.as_ref())
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-
-        let mut sender = self.snd.clone();
-
-        let (tx, rx) = oneshot::channel();
-
-        let message = Message::ConfigChange { change, chan: tx };
-
-        match sender.send(message).await {
-            Ok(_) => (),
-            Err(_) => warn!("send error"),
-        }
-
-        let mut reply = raft_service::RaftResponse::default();
-
-        match timeout(self.timeout, rx).await {
-            Ok(Ok(raft_response)) => {
-                reply.inner = serialize(&raft_response).expect("serialize error");
-            }
-            Ok(_) => (),
-            Err(e) => {
-                reply.inner =
-                    serialize(&RaftResponse::Error("timeout".into())).expect("serialize error");
-                warn!("timeout waiting for reply, {:?}", e);
-            }
-        }
-
-        Ok(Response::new(reply))
-    }
-
-    async fn send_message(
-        &self,
-        request: Request<RiteraftMessage>,
-    ) -> Result<Response<raft_service::RaftResponse>, Status> {
-        let message = RaftMessage::decode(request.into_inner().inner.as_ref())
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        SEND_MESSAGE_ACTIVE_REQUESTS.fetch_add(1, Ordering::SeqCst);
-        let reply = match self.snd.clone().try_send(Message::Raft(Box::new(message))) {
-            Ok(()) => {
-                let response = RaftResponse::Ok;
-                Ok(Response::new(raft_service::RaftResponse {
-                    inner: serialize(&response).unwrap(),
-                }))
-            }
-            Err(_) => Err(Status::unavailable("error for try send message")),
-        };
-        SEND_MESSAGE_ACTIVE_REQUESTS.fetch_sub(1, Ordering::SeqCst);
-        reply
-    }
-
-    async fn send_proposal(
-        &self,
-        req: Request<raft_service::Proposal>,
-    ) -> Result<Response<raft_service::RaftResponse>, Status> {
-        SEND_PROPOSAL_ACTIVE_REQUESTS.fetch_add(1, Ordering::SeqCst);
-        let proposal = req.into_inner().inner;
-        let mut sender = self.snd.clone();
-        let (tx, rx) = oneshot::channel();
-        let message = Message::Propose { proposal, chan: tx };
-
-        let reply = match sender.try_send(message) {
-            Ok(()) => match timeout(self.timeout, rx).await {
-                Ok(Ok(raft_response)) => match serialize(&raft_response) {
-                    Ok(resp) => Ok(Response::new(raft_service::RaftResponse { inner: resp })),
-                    Err(e) => {
-                        warn!("serialize error, {}", e);
-                        Err(Status::unavailable("serialize error"))
-                    }
-                },
+        {
+            Err(anyhow::Error::new(e))
+        } else {
+            let reply = timeout(self.timeout, rx).await;
+            let resp = match reply {
+                Ok(Ok(resp)) => resp,
                 Ok(Err(e)) => {
-                    warn!("recv error for reply, {}", e);
-                    Err(Status::unavailable("recv error for reply"))
+                    warn!("canceled waiting for reply, {:?}", e);
+                    RaftResponse::Error("Canceled".into())
                 }
                 Err(e) => {
-                    warn!("timeout waiting for reply, {}", e);
-                    Err(Status::unavailable("timeout waiting for reply"))
+                    warn!("timeout waiting for reply, {:?}", e);
+                    RaftResponse::Error("Request id timeout".into())
                 }
-            },
-            Err(e) => {
-                warn!("error for try send message, {}", e);
-                Err(Status::unavailable("error for try send message"))
-            }
+            };
+            resp.encode().map(|data| transferpb::Message {
+                ver: 1,
+                priority: 0,
+                data,
+            })
         };
-
-        SEND_PROPOSAL_ACTIVE_REQUESTS.fetch_sub(1, Ordering::SeqCst);
-        reply
+        if let Err(e) = reply_tx.send(res) {
+            log::error!("send reply message error, {:?}", e);
+        }
     }
 
-    async fn send_query(
+    #[inline]
+    async fn _change_config(
         &self,
-        req: Request<raft_service::Query>,
-    ) -> Result<Response<raft_service::RaftResponse>, Status> {
-        let query = req.into_inner().inner;
-        let mut sender = self.snd.clone();
-        let (tx, rx) = oneshot::channel();
-        let message = Message::Query { query, chan: tx };
-        let mut reply = raft_service::RaftResponse::default();
-        match sender.try_send(message) {
-            Ok(()) => {
-                // if we don't receive a response after 2secs, we timeout
-                match timeout(self.timeout, rx).await {
-                    Ok(Ok(raft_response)) => {
-                        reply.inner = serialize(&raft_response).expect("serialize error");
-                    }
-                    Ok(Err(e)) => {
-                        reply.inner = serialize(&RaftResponse::Error(e.to_string()))
-                            .expect("serialize error");
-                        warn!("send query error, {}", e);
-                    }
-                    Err(_e) => {
-                        reply.inner = serialize(&RaftResponse::Error("timeout".into()))
-                            .expect("serialize error");
-                        warn!("timeout waiting for send query reply");
+        change: Vec<u8>,
+        reply_tx: oneshot::Sender<anyhow::Result<transferpb::Message>>,
+    ) {
+        let res = {
+            match ConfChange::decode(change.as_ref()) {
+                Err(e) => Err(anyhow::Error::new(e)),
+                Ok(change) => {
+                    let (tx, rx) = oneshot::channel();
+                    if let Err(e) = self
+                        .snd
+                        .clone()
+                        .send((Priority::MAX, Message::ConfigChange { change, chan: tx }))
+                        .await
+                    {
+                        Err(anyhow::Error::new(e))
+                    } else {
+                        let resp = match timeout(self.timeout, rx).await {
+                            Ok(Ok(raft_resp)) => raft_resp,
+                            Ok(Err(e)) => {
+                                warn!("canceled waiting for reply, {:?}", e);
+                                RaftResponse::Error("Canceled".into())
+                            }
+                            Err(e) => {
+                                warn!("timeout waiting for reply, {:?}", e);
+                                RaftResponse::Error("ConfigChange timeout".into())
+                            }
+                        };
+                        resp.encode().map(|data| transferpb::Message {
+                            ver: 1,
+                            priority: 0,
+                            data,
+                        })
                     }
                 }
             }
+        };
+        if let Err(e) = reply_tx.send(res) {
+            log::error!("send reply message error, {:?}", e);
+        }
+    }
+
+    #[inline]
+    async fn _send_raft_message(&self, req: Vec<u8>) {
+        match eraftpb::Message::decode(req.as_ref()) {
             Err(e) => {
-                reply.inner =
-                    serialize(&RaftResponse::Error(e.to_string())).expect("serialize error");
-                warn!("send query error, {}", e)
+                log::error!("decode raft message error, {:?}", e);
+            }
+            Ok(raft_msg) => {
+                if let Err(e) = self
+                    .snd
+                    .clone()
+                    .send((Priority::MAX, Message::Raft(Box::new(raft_msg))))
+                    .await
+                {
+                    log::error!("send raft message error, {:?}", e);
+                }
             }
         }
+    }
 
-        Ok(Response::new(reply))
+    #[inline]
+    async fn _send_proposal(
+        &self,
+        proposal: Vec<u8>,
+        priority: Priority,
+        reply_tx: oneshot::Sender<anyhow::Result<transferpb::Message>>,
+    ) {
+        let res = {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = self
+                .snd
+                .clone()
+                .send((priority, Message::Propose { proposal, chan: tx }))
+                .await
+            {
+                Err(anyhow::Error::new(e))
+            } else {
+                let resp = match timeout(self.timeout, rx).await {
+                    Ok(Ok(raft_resp)) => raft_resp,
+                    Ok(Err(e)) => {
+                        warn!("canceled waiting for reply, {:?}", e);
+                        RaftResponse::Error("Canceled".into())
+                    }
+                    Err(e) => {
+                        warn!("timeout waiting for reply, {:?}", e);
+                        RaftResponse::Error("Proposal timeout".into())
+                    }
+                };
+                resp.encode().map(|data| transferpb::Message {
+                    ver: 1,
+                    priority: 0,
+                    data,
+                })
+            }
+        };
+        if let Err(e) = reply_tx.send(res) {
+            log::error!("send reply message error, {:?}", e);
+        }
+    }
+
+    #[inline]
+    async fn _send_query(
+        &self,
+        query: Vec<u8>,
+        priority: Priority,
+        reply_tx: oneshot::Sender<anyhow::Result<transferpb::Message>>,
+    ) {
+        let res = {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = self
+                .snd
+                .clone()
+                .send((priority, Message::Query { query, chan: tx }))
+                .await
+            {
+                Err(anyhow::Error::new(e))
+            } else {
+                let resp = match timeout(self.timeout, rx).await {
+                    Ok(Ok(raft_resp)) => raft_resp,
+                    Ok(Err(e)) => {
+                        warn!("canceled waiting for send query reply, {:?}", e);
+                        RaftResponse::Error("Canceled".into())
+                    }
+                    Err(e) => {
+                        warn!("timeout waiting for send query reply, {:?}", e);
+                        RaftResponse::Error("Query timeout".into())
+                    }
+                };
+                resp.encode().map(|data| transferpb::Message {
+                    ver: 1,
+                    priority: 0,
+                    data,
+                })
+            }
+        };
+        if let Err(e) = reply_tx.send(res) {
+            log::error!("send reply message error, {:?}", e);
+        }
     }
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
-use futures::channel::{mpsc, oneshot};
+use futures::channel::oneshot;
 use futures::future::FutureExt;
 use futures::SinkExt;
 use log::{debug, info, warn};
@@ -13,15 +13,22 @@ use once_cell::sync::Lazy;
 use prost::Message as _;
 use tikv_raft::eraftpb::{ConfChange, ConfChangeType};
 use tokio::time::timeout;
-use tonic::Request;
+
+use rust_box::collections::PriorityQueue;
+use rust_box::handy_grpc::client::{
+    Client as GrpcClient, Mailbox as GrpcMailbox, Message as GrpcMessage,
+};
+use rust_box::handy_grpc::Priority;
+use rust_box::mpsc::with_priority_channel;
 
 use crate::error::{Error, Result};
-use crate::message::{Message, RaftResponse, Status};
+use crate::message::{Message, PriorityQueueType, RaftMessage, RaftResponse, Status};
 use crate::raft_node::{Peer, RaftNode};
 use crate::raft_server::RaftServer;
-use crate::raft_service::connect;
-use crate::raft_service::{ConfChange as RiteraftConfChange, Empty, ResultCode};
 use crate::Config;
+
+type Sender<T> = rust_box::mpsc::Sender<T, rust_box::mpsc::SendError<T>>;
+type Receiver<T> = rust_box::mpsc::Receiver<T>;
 
 type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
 
@@ -57,7 +64,7 @@ impl ProposalSender {
 #[derive(Clone)]
 pub struct Mailbox {
     peers: Arc<DashMap<(u64, String), Peer>>,
-    sender: mpsc::Sender<Message>,
+    sender: Sender<(Priority, Message)>,
     grpc_timeout: Duration,
     grpc_concurrency_limit: usize,
     grpc_breaker_threshold: u64,
@@ -136,7 +143,8 @@ impl Mailbox {
             };
             let mut sender = self.sender.clone();
             sender
-                .try_send(proposal)
+                .send((1, proposal))
+                .await //.try_send(proposal)
                 .map_err(|e| Error::SendError(e.to_string()))?;
             let reply = timeout(self.grpc_timeout, rx).await;
             let reply = reply
@@ -200,7 +208,10 @@ impl Mailbox {
     async fn _query(&self, query: Vec<u8>) -> Result<Vec<u8>> {
         let (tx, rx) = oneshot::channel();
         let mut sender = self.sender.clone();
-        match sender.try_send(Message::Query { query, chan: tx }) {
+        match sender
+            .send((Priority::MIN, Message::Query { query, chan: tx }))
+            .await
+        {
             Ok(()) => match timeout(self.grpc_timeout, rx).await {
                 Ok(Ok(RaftResponse::Response { data })) => Ok(data),
                 Ok(Ok(RaftResponse::Error(e))) => Err(Error::from(e)),
@@ -218,7 +229,10 @@ impl Mailbox {
         change.set_change_type(ConfChangeType::RemoveNode);
         let mut sender = self.sender.clone();
         let (chan, rx) = oneshot::channel();
-        match sender.send(Message::ConfigChange { change, chan }).await {
+        match sender
+            .send((Priority::MAX, Message::ConfigChange { change, chan }))
+            .await
+        {
             Ok(()) => match rx.await {
                 Ok(RaftResponse::Ok) => Ok(()),
                 Ok(RaftResponse::Error(e)) => Err(Error::from(e)),
@@ -232,7 +246,10 @@ impl Mailbox {
     pub async fn status(&self) -> Result<Status> {
         let (tx, rx) = oneshot::channel();
         let mut sender = self.sender.clone();
-        match sender.send(Message::Status { chan: tx }).await {
+        match sender
+            .send((Priority::MAX, Message::Status { chan: tx }))
+            .await
+        {
             Ok(_) => match timeout(self.grpc_timeout, rx).await {
                 Ok(Ok(RaftResponse::Status(status))) => Ok(status),
                 Ok(Ok(RaftResponse::Error(e))) => Err(Error::from(e)),
@@ -245,8 +262,9 @@ impl Mailbox {
 
 pub struct Raft<S: Store + 'static> {
     store: S,
-    tx: mpsc::Sender<Message>,
-    rx: mpsc::Receiver<Message>,
+    channel_queue: PriorityQueueType<Priority, Message>,
+    tx: Sender<(Priority, Message)>,
+    rx: Receiver<(Priority, Message)>,
     addr: SocketAddr,
     logger: slog::Logger,
     cfg: Arc<Config>,
@@ -264,10 +282,14 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             .to_socket_addrs()?
             .next()
             .ok_or_else(|| Error::from("None"))?;
-        let (tx, rx) = mpsc::channel(100_000);
+        let channel_queue = Arc::new(parking_lot::RwLock::new(PriorityQueue::default()));
+        //let (tx, rx) = mpsc::channel(100_000);
+        let (tx, mut rx) =
+            with_priority_channel::<Priority, Message>(channel_queue.clone(), 10_000);
         let cfg = Arc::new(cfg);
         Ok(Self {
             store,
+            channel_queue,
             tx,
             rx,
             addr,
@@ -290,11 +312,12 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
 
     /// find leader id and leader address
     pub async fn find_leader_info(&self, peer_addrs: Vec<String>) -> Result<Option<(u64, String)>> {
+        let grpc_timeout = self.cfg.grpc_timeout;
         let mut futs = Vec::new();
         for addr in peer_addrs {
             let fut = async {
                 let _addr = addr.clone();
-                match self.request_leader(addr).await {
+                match Self::request_leader(addr, grpc_timeout).await {
                     Ok(reply) => Ok(reply),
                     Err(e) => {
                         info!("find_leader, addr: {}, {:?}", _addr, e);
@@ -306,8 +329,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         }
 
         let (leader_id, leader_addr) = match futures::future::select_ok(futs).await {
-            Ok((Some((leader_id, leader_addr)), _)) => (leader_id, leader_addr),
-            Ok((None, _)) => return Err(Error::LeaderNotExist),
+            Ok(((leader_id, leader_addr), _)) => (leader_id, leader_addr),
             Err(_e) => return Ok(None),
         };
 
@@ -319,27 +341,29 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         }
     }
 
-    async fn request_leader(&self, peer_addr: String) -> Result<Option<(u64, String)>> {
-        let (leader_id, leader_addr): (u64, String) = {
-            let mut client = connect(&peer_addr, 1, self.cfg.grpc_timeout).await?;
-            let response = client
-                .request_id(Request::new(Empty::default()))
-                .await?
-                .into_inner();
-            match response.code() {
-                ResultCode::WrongLeader => {
-                    let (leader_id, addr): (u64, Option<String>) = deserialize(&response.data)?;
-                    if let Some(addr) = addr {
-                        (leader_id, addr)
-                    } else {
-                        return Ok(None);
-                    }
-                }
-                ResultCode::Ok => (deserialize(&response.data)?, peer_addr),
-                ResultCode::Error => return Ok(None),
-            }
+    async fn request_leader(peer_addr: String, grpc_timeout: Duration) -> Result<(u64, String)> {
+        let mut client = GrpcClient::new(peer_addr.clone())
+            .concurrency_limit(1)
+            .connect_timeout(grpc_timeout)
+            .connect()
+            .await
+            .map_err(|e| Error::Msg(e.to_string()))?;
+
+        let msg = GrpcMessage {
+            ver: 1,
+            priority: 0,
+            data: RaftMessage::IsLeader.encode()?,
         };
-        Ok(Some((leader_id, leader_addr)))
+        let result = tokio::time::timeout(grpc_timeout, client.send(msg)).await;
+        let result = result.map_err(|_| Error::Elapsed)??;
+        let raft_resp = RaftResponse::decode(&result.data)?;
+        match raft_resp {
+            RaftResponse::IsLeader { leader_id } => Ok((leader_id, peer_addr)),
+            _ => {
+                log::warn!("request leader info error, {:?}", raft_resp);
+                Err(Error::LeaderNotExist)
+            }
+        }
     }
 
     /// Create a new leader for the cluster, with id 1. There has to be exactly one node in the
@@ -391,9 +415,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         let (leader_id, leader_addr): (u64, String) = if let Some(leader_id) = leader_id {
             (leader_id, leader_addr)
         } else {
-            self.request_leader(leader_addr)
-                .await?
-                .ok_or(Error::JoinError)?
+            Self::request_leader(leader_addr, self.cfg.grpc_timeout).await?
         };
 
         // 2. run server and node to prepare for joining
@@ -406,7 +428,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             self.cfg.clone(),
         )?;
         let peer = node.add_peer(&leader_addr, leader_id);
-        let mut client = peer.client().await?;
+        //let mut client = peer.client().await?;
         let server = RaftServer::new(self.tx, self.addr, self.cfg.clone());
         let server_handle = async {
             if let Err(e) = server.run().await {
@@ -421,19 +443,13 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         let mut change_remove = ConfChange::default();
         change_remove.set_node_id(node_id);
         change_remove.set_change_type(ConfChangeType::RemoveNode);
-        let change_remove = RiteraftConfChange {
-            inner: ConfChange::encode_to_vec(&change_remove),
-        };
+        //let change_remove = RiteraftConfChange {
+        //    inner: ConfChange::encode_to_vec(&change_remove),
+        //};
 
-        let raft_response = client
-            .change_config(Request::new(change_remove))
-            .await?
-            .into_inner();
+        let raft_response = peer.change_config(change_remove).await?;
 
-        info!(
-            "change_remove raft_response: {:?}",
-            deserialize(&raft_response.inner)?
-        );
+        info!("change_remove raft_response: {:?}", raft_response);
 
         // 3. Join the cluster
         // TODO: handle wrong leader
@@ -443,17 +459,14 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         change.set_context(serialize(&self.addr.to_string())?);
         // change.set_context(serialize(&self.addr)?);
 
-        let change = RiteraftConfChange {
-            inner: ConfChange::encode_to_vec(&change),
-        };
-        let raft_response = client
-            .change_config(Request::new(change))
-            .await?
-            .into_inner();
+        //let change = RiteraftConfChange {
+        //    inner: ConfChange::encode_to_vec(&change),
+        //};
+        let raft_response = peer.change_config(change).await?;
         if let RaftResponse::JoinSuccess {
             assigned_id,
             peer_addrs,
-        } = deserialize(&raft_response.inner)?
+        } = raft_response
         {
             info!(
                 "change_config response.assigned_id: {:?}, peer_addrs: {:?}",

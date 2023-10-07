@@ -8,10 +8,6 @@ pub enum Error {
     RaftError(#[from] tikv_raft::Error),
     #[error("Error joining the cluster")]
     JoinError,
-    #[error("gprc error: `{0}`")]
-    Grpc(#[from] tonic::transport::Error),
-    #[error("error calling remote procedure: `{0}`")]
-    RemoteCall(#[from] tonic::Status),
     #[error("io error: {0}")]
     Io(String),
     #[error("unexpected error, {0}")]

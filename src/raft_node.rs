@@ -5,34 +5,34 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bincode::{deserialize, serialize};
-use futures::channel::{mpsc, oneshot};
-use futures::SinkExt;
+use futures::channel::oneshot;
 use futures::StreamExt;
 use log::*;
 use prost::Message as _;
-use tikv_raft::eraftpb::{ConfChange, ConfChangeType, Entry, EntryType, Message as RaftMessage};
+use tikv_raft::eraftpb::{self, ConfChange, ConfChangeType, Entry, EntryType};
 use tikv_raft::{prelude::*, raw_node::RawNode, Config as RaftConfig};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use tonic::Request;
+
+use rust_box::handy_grpc::client::{
+    Client as GrpcClient, Mailbox as GrpcMailbox, Message as GrpcMessage,
+};
+use rust_box::handy_grpc::Priority;
 
 use crate::error::{Error, Result};
-use crate::message::{Merger, Message, Proposals, RaftResponse, ReplyChan, Status};
+use crate::message::{Merger, Message, Proposals, RaftMessage, RaftResponse, ReplyChan, Status};
+use crate::message::{Receiver, Sender};
 use crate::raft::Store;
 use crate::raft::{active_mailbox_querys, active_mailbox_sends};
 use crate::raft_server::{send_message_active_requests, send_proposal_active_requests};
-use crate::raft_service::raft_service_client::RaftServiceClient;
-use crate::raft_service::{connect, Message as RraftMessage, Proposal as RraftProposal, Query};
 use crate::storage::{LogStore, MemStorage};
 use crate::Config;
 
-pub type RaftGrpcClient = RaftServiceClient<tonic::transport::channel::Channel>;
-
 struct MessageSender {
-    message: RaftMessage,
+    message: eraftpb::Message,
     client: Peer,
     client_id: u64,
-    chan: mpsc::Sender<Message>,
+    chan: Sender<(Priority, Message)>,
     max_retries: usize,
     timeout: Duration,
 }
@@ -58,9 +58,12 @@ impl MessageSender {
                         );
                         if let Err(e) = self
                             .chan
-                            .send(Message::ReportUnreachable {
-                                node_id: self.client_id,
-                            })
+                            .send((
+                                Priority::MIN,
+                                Message::ReportUnreachable {
+                                    node_id: self.client_id,
+                                },
+                            ))
                             .await
                         {
                             warn!(
@@ -86,57 +89,47 @@ struct QuerySender {
 
 impl QuerySender {
     async fn send(self) {
-        let mut current_retry = 0usize;
-
-        let mut client = match self.client.client().await {
+        let mut client = match self.client.grpc_client().await {
             Ok(c) => c,
             Err(e) => {
-                warn!("error sending query after, {:?}", e);
                 if let Err(e) = self.chan.send(RaftResponse::Error(e.to_string())) {
-                    warn!(
-                        "send_query, Message::Query, RaftResponse send error: {:?}",
-                        e
-                    );
+                    warn!("send_query, Message::Query, send result error: {:?}", e);
                 }
                 return;
             }
         };
 
-        loop {
-            let message_request = Request::new(Query {
-                inner: self.query.clone(),
-            });
-            match client.send_query(message_request).await {
-                Ok(grpc_response) => {
-                    let raft_response =
-                        deserialize(&grpc_response.into_inner().inner).expect("deserialize error");
-                    if let Err(e) = self.chan.send(raft_response) {
-                        warn!(
-                            "send_query, Message::Query, RaftResponse send error: {:?}",
-                            e
-                        );
-                    }
-                    return;
+        let query = RaftMessage::Query { query: self.query }.encode();
+        let query = match query {
+            Ok(q) => q,
+            Err(e) => {
+                if let Err(e) = self.chan.send(RaftResponse::Error(e.to_string())) {
+                    warn!("send_query, Message::Query, send result error: {:?}", e);
                 }
-                Err(e) => {
-                    if current_retry < self.max_retries {
-                        current_retry += 1;
-                        tokio::time::sleep(self.timeout).await;
-                    } else {
-                        warn!(
-                            "error sending query after {} retries: {}",
-                            self.max_retries, e
-                        );
-                        if let Err(e) = self.chan.send(RaftResponse::Error(e.to_string())) {
-                            warn!(
-                                "send_query, Message::Query, RaftResponse send error: {:?}",
-                                e
-                            );
-                        }
-                        return;
-                    }
-                }
+                return;
             }
+        };
+
+        let res = match timeout(
+            self.timeout,
+            client.send(GrpcMessage {
+                ver: 1,
+                priority: 0,
+                data: query,
+            }),
+        )
+        .await
+        {
+            Err(_) => RaftResponse::Error("Message::Query timeout".into()),
+            Ok(Err(e)) => RaftResponse::Error(e.to_string()),
+            Ok(Ok(raft_resp)) => match RaftResponse::decode(raft_resp.data.as_slice()) {
+                Ok(raft_resp) => raft_resp,
+                Err(e) => RaftResponse::Error(e.to_string()),
+            },
+        };
+
+        if let Err(e) = self.chan.send(res) {
+            warn!("send_query, Message::Query, send result error: {:?}", e);
         }
     }
 }
@@ -144,7 +137,8 @@ impl QuerySender {
 #[derive(Clone)]
 pub struct Peer {
     addr: String,
-    client: Arc<RwLock<Option<RaftGrpcClient>>>,
+    client_transfer: Arc<RwLock<Option<(GrpcClient, GrpcMailbox)>>>,
+    client_transfer_queue_cap: usize, //@TODO config ...
     grpc_fails: Arc<AtomicU64>,
     grpc_fail_time: Arc<AtomicI64>,
     crw_timeout: Duration,
@@ -165,7 +159,8 @@ impl Peer {
         debug!("connecting to node at {}...", addr);
         Peer {
             addr,
-            client: Arc::new(RwLock::new(None)),
+            client_transfer: Arc::new(RwLock::new(None)),
+            client_transfer_queue_cap: 100_000,
             grpc_fails: Arc::new(AtomicU64::new(0)),
             grpc_fail_time: Arc::new(AtomicI64::new(0)),
             crw_timeout,
@@ -187,43 +182,69 @@ impl Peer {
     }
 
     #[inline]
-    async fn connect(&self) -> Result<RaftGrpcClient> {
-        if let Some(c) = self.client.read().await.as_ref() {
+    async fn _grpc_client(&self) -> Result<(GrpcClient, GrpcMailbox)> {
+        log::info!("_grpc_client, addr: {}", self.addr);
+        let mut c = GrpcClient::new(self.addr.clone())
+            .concurrency_limit(self.concurrency_limit)
+            .connect_timeout(self.crw_timeout)
+            .connect()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?;
+
+        let mbox = c.transfer_start(self.client_transfer_queue_cap).await;
+        Ok((c, mbox))
+    }
+
+    #[inline]
+    pub async fn grpc_client(&self) -> Result<GrpcClient> {
+        if let Some((c, _)) = self.client_transfer.read().await.as_ref() {
             return Ok(c.clone());
         }
 
-        let mut client = self.client.write().await;
-        if let Some(c) = client.as_ref() {
-            return Ok(c.clone());
-        }
-
-        let c = connect(&self.addr, self.concurrency_limit, self.crw_timeout).await?;
-        client.replace(c.clone());
+        let (c, mbox) = self._grpc_client().await?;
+        self.client_transfer
+            .write()
+            .await
+            .replace((c.clone(), mbox));
         Ok(c)
     }
 
     #[inline]
-    pub async fn client(&self) -> Result<RaftGrpcClient> {
-        self.connect().await
+    pub async fn grpc_client_transfer(&self) -> Result<GrpcMailbox> {
+        if let Some((_, mbox)) = self.client_transfer.read().await.as_ref() {
+            return Ok(mbox.clone());
+        }
+
+        let (c, mbox) = self._grpc_client().await?;
+        self.client_transfer
+            .write()
+            .await
+            .replace((c, mbox.clone()));
+        Ok(mbox)
     }
 
     ///Raft Message
     #[inline]
-    pub async fn send_message(&self, msg: &RaftMessage) -> Result<Vec<u8>> {
+    pub async fn send_message(&self, msg: &eraftpb::Message) -> Result<()> {
         if !self.available() {
             return Err(Error::Msg("The gRPC remote service is unavailable".into()));
         }
 
-        let msg = RraftMessage {
-            inner: RaftMessage::encode_to_vec(msg),
+        let msg = GrpcMessage {
+            ver: 1,
+            priority: 255,
+            data: RaftMessage::Raft {
+                msg: msg.encode_to_vec(), //eraftpb::Message::encode_to_vec(msg),
+            }
+            .encode()?, //eraftpb::Message::encode_to_vec(msg),
         };
         self.active_tasks.fetch_add(1, Ordering::SeqCst);
         let reply = self._send_message(msg).await;
         self.active_tasks.fetch_sub(1, Ordering::SeqCst);
         match reply {
-            Ok(reply) => {
+            Ok(()) => {
                 self.record_success();
-                Ok(reply)
+                Ok(())
             }
             Err(e) => {
                 self.record_failure();
@@ -233,18 +254,13 @@ impl Peer {
     }
 
     #[inline]
-    async fn _send_message(&self, msg: RraftMessage) -> Result<Vec<u8>> {
-        let c = self.connect().await?;
-        async fn task(mut c: RaftGrpcClient, msg: RraftMessage) -> Result<Vec<u8>> {
-            let message_request = Request::new(msg);
-            let response = c.send_message(message_request).await?;
-            let message_reply = response.into_inner();
-            Ok(message_reply.inner)
-        }
-
-        let result = tokio::time::timeout(self.crw_timeout, task(c, msg)).await;
-        let result = result.map_err(|_| Error::Elapsed)??;
-        Ok(result)
+    async fn _send_message(&self, msg: GrpcMessage) -> Result<()> {
+        let mut transfer = self.grpc_client_transfer().await?;
+        tokio::time::timeout(self.crw_timeout, transfer.quick_send(msg))
+            .await
+            .map_err(|_| Error::Elapsed)?
+            .map_err(|e| Error::SendError(e.to_string()))?;
+        Ok(())
     }
 
     #[inline]
@@ -253,7 +269,12 @@ impl Peer {
             return Err(Error::Msg("The gRPC remote service is unavailable".into()));
         }
 
-        let msg = RraftProposal { inner: msg };
+        let msg = GrpcMessage {
+            ver: 1,
+            priority: 1,
+            data: RaftMessage::Propose { proposal: msg }.encode()?,
+        };
+
         let _active_tasks = self.active_tasks.fetch_add(1, Ordering::SeqCst);
         let reply = self._send_proposal(msg).await;
         self.active_tasks.fetch_sub(1, Ordering::SeqCst);
@@ -270,19 +291,28 @@ impl Peer {
     }
 
     #[inline]
-    async fn _send_proposal(&self, msg: RraftProposal) -> Result<Vec<u8>> {
-        let c = self.connect().await?;
+    async fn _send_proposal(&self, msg: GrpcMessage) -> Result<Vec<u8>> {
+        let mut c = self.grpc_client().await?;
 
-        async fn task(mut c: RaftGrpcClient, msg: RraftProposal) -> Result<Vec<u8>> {
-            let message_request = Request::new(msg);
-            let response = c.send_proposal(message_request).await?;
-            let message_reply = response.into_inner();
-            Ok(message_reply.inner)
-        }
-
-        let result = tokio::time::timeout(self.crw_timeout, task(c, msg)).await;
+        let result = tokio::time::timeout(self.crw_timeout, c.send(msg)).await;
         let result = result.map_err(|_| Error::Elapsed)??;
-        Ok(result)
+        Ok(result.data)
+    }
+
+    #[inline]
+    pub async fn change_config(&self, change: ConfChange) -> Result<RaftResponse> {
+        let mut c = self.grpc_client().await?;
+        let msg = GrpcMessage {
+            ver: 1,
+            priority: 255,
+            data: RaftMessage::ConfigChange {
+                change: change.encode_to_vec(),
+            }
+            .encode()?,
+        };
+        let result = tokio::time::timeout(self.crw_timeout, c.send(msg)).await;
+        let result = result.map_err(|_| Error::Elapsed)??;
+        Ok(RaftResponse::decode(&result.data)?)
     }
 
     #[inline]
@@ -314,22 +344,21 @@ impl Peer {
 pub struct RaftNode<S: Store> {
     inner: RawNode<MemStorage>,
     pub peers: HashMap<u64, Option<Peer>>,
-    pub rcv: mpsc::Receiver<Message>,
-    pub snd: mpsc::Sender<Message>,
+    pub rcv: Receiver<(Priority, Message)>,
+    pub snd: Sender<(Priority, Message)>,
     store: S,
-    // #[allow(dead_code)]
-    // msg_tx: mpsc::Sender<MessageSender>,
     uncommitteds: HashMap<u64, ReplyChan>,
     should_quit: bool,
     seq: AtomicU64,
     last_snap_time: Instant,
+    request_votes: usize,
     cfg: Arc<Config>,
 }
 
 impl<S: Store + 'static> RaftNode<S> {
     pub fn new_leader(
-        rcv: mpsc::Receiver<Message>,
-        snd: mpsc::Sender<Message>,
+        rcv: Receiver<(Priority, Message)>,
+        snd: Sender<(Priority, Message)>,
         id: u64,
         store: S,
         logger: &slog::Logger,
@@ -369,14 +398,15 @@ impl<S: Store + 'static> RaftNode<S> {
             snd,
             should_quit: false,
             last_snap_time,
+            request_votes: 0,
             cfg,
         };
         Ok(node)
     }
 
     pub fn new_follower(
-        rcv: mpsc::Receiver<Message>,
-        snd: mpsc::Sender<Message>,
+        rcv: Receiver<(Priority, Message)>,
+        snd: Sender<(Priority, Message)>,
         id: u64,
         store: S,
         logger: &slog::Logger,
@@ -403,6 +433,7 @@ impl<S: Store + 'static> RaftNode<S> {
             snd,
             should_quit: false,
             last_snap_time,
+            request_votes: 0,
             cfg,
         })
     }
@@ -474,6 +505,7 @@ impl<S: Store + 'static> RaftNode<S> {
             id: self.inner.raft.id,
             leader_id,
             uncommitteds: self.uncommitteds.len(),
+            request_votes: self.request_votes,
             active_mailbox_sends: active_mailbox_sends(),
             active_mailbox_querys: active_mailbox_querys(),
             active_send_proposal_grpc_requests: send_proposal_active_requests(),
@@ -546,11 +578,11 @@ impl<S: Store + 'static> RaftNode<S> {
     }
 
     #[inline]
-    fn send_leader_id(&self, chan: oneshot::Sender<RaftResponse>) {
-        if let Err(e) = chan.send(RaftResponse::RequestId {
+    fn send_is_leader(&self, chan: oneshot::Sender<RaftResponse>) {
+        if let Err(e) = chan.send(RaftResponse::IsLeader {
             leader_id: self.leader(),
         }) {
-            warn!("Message::RequestId, RaftResponse send error: {:?}", e);
+            warn!("Message::IsLeader, RaftResponse send error: {:?}", e);
         }
     }
 
@@ -591,7 +623,7 @@ impl<S: Store + 'static> RaftNode<S> {
                 return Ok(());
             }
             match timeout(heartbeat, self.rcv.next()).await {
-                Ok(Some(Message::ConfigChange { chan, mut change })) => {
+                Ok(Some((_, Message::ConfigChange { chan, mut change }))) => {
                     info!("change Received, {:?}", change);
                     // whenever a change id is 0, it's a message to self.
                     if change.get_node_id() == 0 {
@@ -613,7 +645,7 @@ impl<S: Store + 'static> RaftNode<S> {
                         }
                     }
                 }
-                Ok(Some(Message::Raft(m))) => {
+                Ok(Some((_, Message::Raft(m)))) => {
                     debug!(
                         "raft message: to={} from={} msg_type={:?}, commit={}, {:?}",
                         self.raft.id,
@@ -623,6 +655,10 @@ impl<S: Store + 'static> RaftNode<S> {
                         m
                     );
                     let msg_type = m.get_msg_type();
+                    if MessageType::MsgRequestVote == msg_type {
+                        self.request_votes += 1;
+                    }
+
                     if !snapshot_received && msg_type == MessageType::MsgHeartbeat {
                         info!(
                             "raft message, snapshot_received: {}, has_leader: {}, {:?}",
@@ -642,7 +678,7 @@ impl<S: Store + 'static> RaftNode<S> {
                         }
                     }
                 }
-                Ok(Some(Message::Propose { proposal, chan })) => {
+                Ok(Some((_, Message::Propose { proposal, chan }))) => {
                     let now = Instant::now();
                     if !self.is_leader() {
                         debug!("Message::Propose, send_wrong_leader {:?}", proposal);
@@ -656,7 +692,7 @@ impl<S: Store + 'static> RaftNode<S> {
                     }
                 }
 
-                Ok(Some(Message::Query { query, chan })) => {
+                Ok(Some((_, Message::Query { query, chan }))) => {
                     let now = Instant::now();
                     if !self.is_leader() {
                         debug!("[forward_query] query.len: {:?}", query.len());
@@ -670,19 +706,19 @@ impl<S: Store + 'static> RaftNode<S> {
                     }
                 }
 
-                Ok(Some(Message::RequestId { chan })) => {
+                Ok(Some((_, Message::IsLeader { chan }))) => {
                     if !self.is_leader() {
                         // TODO: retry strategy in case of failure
                         info!("requested Id, but not leader");
                         self.send_wrong_leader(chan);
                     } else {
-                        self.send_leader_id(chan);
+                        self.send_is_leader(chan);
                     }
                 }
-                Ok(Some(Message::Status { chan })) => {
+                Ok(Some((_, Message::Status { chan }))) => {
                     self.send_status(chan);
                 }
-                Ok(Some(Message::ReportUnreachable { node_id })) => {
+                Ok(Some((_, Message::ReportUnreachable { node_id }))) => {
                     debug!("Message::ReportUnreachable, node_id: {}", node_id);
                     self.report_unreachable(node_id);
                 }
@@ -776,7 +812,7 @@ impl<S: Store + 'static> RaftNode<S> {
         Ok(())
     }
 
-    fn send_messages(&mut self, msgs: Vec<RaftMessage>) {
+    fn send_messages(&mut self, msgs: Vec<eraftpb::Message>) {
         for message in msgs {
             // for message in ready.messages.drain(..) {
             let client_id = message.get_to();
@@ -790,12 +826,9 @@ impl<S: Store + 'static> RaftNode<S> {
                 client,
                 client_id,
                 chan: self.snd.clone(),
-                max_retries: 1,
+                max_retries: 0,
                 timeout: Duration::from_millis(500),
             };
-            // if let Err(e) = self.msg_tx.try_send(message_sender) {
-            //     log::warn!("msg_tx.try_send, error: {:?}", e.to_string());
-            // }
             tokio::spawn(message_sender.send());
         }
     }
@@ -820,8 +853,7 @@ impl<S: Store + 'static> RaftNode<S> {
     async fn handle_config_change(&mut self, entry: &Entry) -> Result<()> {
         info!("handle_config_change, entry: {:?}", entry);
         let seq: u64 = deserialize(entry.get_context())?;
-        let change = ConfChange::decode(entry.get_data())
-            .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+        let change = ConfChange::decode(entry.get_data()).map_err(|e| Error::Msg(e.to_string()))?;
         let id = change.get_node_id();
 
         let change_type = change.get_change_type();

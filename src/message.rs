@@ -1,9 +1,53 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures::channel::oneshot::Sender;
+use futures::channel::oneshot;
 use serde::{Deserialize, Serialize};
-use tikv_raft::eraftpb::{ConfChange, Message as RaftMessage};
+use tikv_raft::eraftpb::{self, ConfChange};
+
+use rust_box::collections::PriorityQueue;
+
+pub(crate) type Sender<T> = rust_box::mpsc::Sender<T, rust_box::mpsc::SendError<T>>;
+pub(crate) type Receiver<T> = rust_box::mpsc::Receiver<T>;
+pub(crate) type PriorityQueueType<P, T> = Arc<parking_lot::RwLock<PriorityQueue<P, T>>>;
+
+#[allow(dead_code)]
+#[derive(Serialize, Deserialize, Debug)]
+pub enum RaftMessage {
+    Propose {
+        proposal: Vec<u8>,
+        //chan: Sender<RaftResponse>,
+    },
+    Query {
+        query: Vec<u8>,
+        //chan: Sender<RaftResponse>,
+    },
+    ConfigChange {
+        change: Vec<u8>, //ConfChange,
+                         //chan: Sender<RaftResponse>,
+    },
+    IsLeader, //chan: Sender<RaftResponse>,
+    ReportUnreachable {
+        node_id: u64,
+    },
+    Raft {
+        msg: Vec<u8>,
+        //msg: eraftpb::Message,
+    },
+    Status,
+}
+
+impl RaftMessage {
+    #[inline]
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+    }
+    #[inline]
+    pub fn decode(data: &[u8]) -> anyhow::Result<RaftMessage> {
+        Ok(bincode::deserialize(data).map_err(anyhow::Error::new)?)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RaftResponse {
@@ -15,7 +59,7 @@ pub enum RaftResponse {
         assigned_id: u64,
         peer_addrs: HashMap<u64, String>,
     },
-    RequestId {
+    IsLeader {
         leader_id: u64,
     },
     Error(String),
@@ -26,29 +70,40 @@ pub enum RaftResponse {
     Ok,
 }
 
+impl RaftResponse {
+    #[inline]
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(bincode::serialize(self).map_err(anyhow::Error::new)?)
+    }
+    #[inline]
+    pub fn decode(data: &[u8]) -> anyhow::Result<RaftResponse> {
+        Ok(bincode::deserialize(data).map_err(anyhow::Error::new)?)
+    }
+}
+
 #[allow(dead_code)]
 pub enum Message {
     Propose {
         proposal: Vec<u8>,
-        chan: Sender<RaftResponse>,
+        chan: oneshot::Sender<RaftResponse>,
     },
     Query {
         query: Vec<u8>,
-        chan: Sender<RaftResponse>,
+        chan: oneshot::Sender<RaftResponse>,
     },
     ConfigChange {
         change: ConfChange,
-        chan: Sender<RaftResponse>,
+        chan: oneshot::Sender<RaftResponse>,
     },
-    RequestId {
-        chan: Sender<RaftResponse>,
+    IsLeader {
+        chan: oneshot::Sender<RaftResponse>,
     },
     ReportUnreachable {
         node_id: u64,
     },
-    Raft(Box<RaftMessage>),
+    Raft(Box<eraftpb::Message>),
     Status {
-        chan: Sender<RaftResponse>,
+        chan: oneshot::Sender<RaftResponse>,
     },
 }
 
@@ -57,6 +112,7 @@ pub struct Status {
     pub id: u64,
     pub leader_id: u64,
     pub uncommitteds: usize,
+    pub request_votes: usize,
     pub active_mailbox_sends: isize,
     pub active_mailbox_querys: isize,
     pub active_send_proposal_grpc_requests: isize,
@@ -77,8 +133,8 @@ impl Status {
 }
 
 pub(crate) enum ReplyChan {
-    One((Sender<RaftResponse>, Instant)),
-    More(Vec<(Sender<RaftResponse>, Instant)>),
+    One((oneshot::Sender<RaftResponse>, Instant)),
+    More(Vec<(oneshot::Sender<RaftResponse>, Instant)>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -89,7 +145,7 @@ pub(crate) enum Proposals {
 
 pub(crate) struct Merger {
     proposals: Vec<Vec<u8>>,
-    chans: Vec<(Sender<RaftResponse>, Instant)>,
+    chans: Vec<(oneshot::Sender<RaftResponse>, Instant)>,
     start_collection_time: i64,
     proposal_batch_size: usize,
     proposal_batch_timeout: i64,
@@ -107,7 +163,7 @@ impl Merger {
     }
 
     #[inline]
-    pub fn add(&mut self, proposal: Vec<u8>, chan: Sender<RaftResponse>) {
+    pub fn add(&mut self, proposal: Vec<u8>, chan: oneshot::Sender<RaftResponse>) {
         self.proposals.push(proposal);
         self.chans.push((chan, Instant::now()));
     }

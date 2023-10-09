@@ -261,25 +261,20 @@ pub struct Raft<S: Store + 'static> {
     channel_queue: PriorityQueueType<Priority, Message>,
     tx: Sender<(Priority, Message)>,
     rx: Receiver<(Priority, Message)>,
-    addr: SocketAddr,
+    addr: String,
     logger: slog::Logger,
     cfg: Arc<Config>,
 }
 
 impl<S: Store + Send + Sync + 'static> Raft<S> {
     /// creates a new node with the given address and store.
-    pub fn new<A: ToSocketAddrs>(
+    pub fn new<A: Into<String>>(
         addr: A,
         store: S,
         logger: slog::Logger,
         cfg: Config,
     ) -> Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| Error::from("None"))?;
         let channel_queue = Arc::new(parking_lot::RwLock::new(PriorityQueue::default()));
-        //let (tx, rx) = mpsc::channel(100_000);
         let (tx, rx) = with_priority_channel::<Priority, Message>(channel_queue.clone(), 10_000);
         let cfg = Arc::new(cfg);
         Ok(Self {
@@ -287,7 +282,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             channel_queue,
             tx,
             rx,
-            addr,
+            addr: addr.into(),
             logger,
             cfg,
         })
@@ -420,7 +415,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         } else {
             Self::request_leader(leader_addr, self.cfg.grpc_timeout).await?
         };
-
+        let laddr = self.addr.clone();
         let server = RaftServer::new(self.tx.clone(), self.addr, self.cfg.clone());
 
         // 2. run server and node to prepare for joining
@@ -462,12 +457,9 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         let mut change = ConfChange::default();
         change.set_node_id(node_id);
         change.set_change_type(ConfChangeType::AddNode);
-        change.set_context(serialize(&self.addr.to_string())?);
-        // change.set_context(serialize(&self.addr)?);
+        //change.set_context(serialize(&self.addr.to_string())?);
+        change.set_context(serialize(&laddr)?);
 
-        //let change = RiteraftConfChange {
-        //    inner: ConfChange::encode_to_vec(&change),
-        //};
         let raft_response = peer.change_config(change).await?;
         if let RaftResponse::JoinSuccess {
             assigned_id,
@@ -498,5 +490,24 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
         let _ = tokio::try_join!(server_handle, node_handle)?;
         info!("leaving follower node");
         Ok(())
+    }
+}
+
+pub(crate) fn parse_socket_addrs(addr: &str) -> Result<Vec<SocketAddr>> {
+    match addr.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs = addrs.collect::<Vec<SocketAddr>>();
+            if addrs.is_empty() {
+                let err = Error::from("The result of parsing the socket address is empty");
+                log::warn!("to_socket_addrs error, {:?}", err);
+                Err(err)
+            } else {
+                Ok(addrs)
+            }
+        }
+        Err(e) => {
+            log::warn!("to_socket_addrs error, {:?}", e);
+            Err(Error::from(e))
+        }
     }
 }

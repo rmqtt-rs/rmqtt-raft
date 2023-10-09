@@ -41,8 +41,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 anyhow = "1.0"
 once_cell = "1"
 parking_lot = "0.12"
-#rust-box = { path = "../../try-box/rust-box", features = ["handy-grpc", "mpsc", "collections"] }
-rust-box = { version = "0.9", features = ["handy-grpc", "mpsc", "collections"] }
+#rust-box = { path = "../../try-box/rust-box", features = ["handy-grpc", "handy-grpc-reuse", "mpsc", "collections"] }
+rust-box = { version = "0.9", features = ["handy-grpc", "handy-grpc-reuse", "mpsc", "collections"] }
 
 
 [build-dependencies]

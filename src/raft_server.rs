@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,19 +19,20 @@ use super::message::PriorityQueueType;
 use super::message::RaftMessage;
 use super::message::Sender;
 use super::message::{Message, RaftResponse, ServerGrpcMessage};
+use super::raft::parse_socket_addrs;
 use super::{error, Config};
 
 #[derive(Clone)]
 pub struct RaftServer {
     pub(crate) channel_queue: PriorityQueueType<Priority, ServerGrpcMessage>,
     snd: Sender<(Priority, Message)>,
-    laddr: SocketAddr,
+    laddr: String,
     timeout: Duration,
     cfg: Arc<Config>,
 }
 
 impl RaftServer {
-    pub fn new(snd: Sender<(Priority, Message)>, laddr: SocketAddr, cfg: Arc<Config>) -> Self {
+    pub fn new(snd: Sender<(Priority, Message)>, laddr: String, cfg: Arc<Config>) -> Self {
         let channel_queue = Arc::new(parking_lot::RwLock::new(PriorityQueue::default()));
         RaftServer {
             channel_queue,
@@ -44,7 +44,7 @@ impl RaftServer {
     }
 
     pub async fn run(&self) -> error::Result<()> {
-        let laddr = self.laddr;
+        let laddr = self.laddr.clone();
         let _cfg = self.cfg.clone();
         info!("listening gRPC requests on: {}", laddr);
 
@@ -55,8 +55,34 @@ impl RaftServer {
 
         let run_receiver_fut = async move {
             loop {
-                if let Err(e) = grpc_run(laddr, tx.clone(), None, None).await {
-                    log::error!("Run gRPC receiver error, {:?}", e);
+                match parse_socket_addrs(&laddr) {
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                        continue;
+                    }
+                    Ok(sock_laddrs) => {
+                        for sock_laddr in sock_laddrs {
+                            if let Err(e) = grpc_run(
+                                sock_laddr,
+                                tx.clone(),
+                                None,
+                                None,
+                                #[cfg(feature = "reuseaddr")]
+                                _cfg.reuseaddr,
+                                #[cfg(feature = "reuseport")]
+                                _cfg.reuseport,
+                            )
+                            .await
+                            {
+                                log::error!(
+                                    "Run gRPC receiver error, {}({}), {:?}",
+                                    laddr,
+                                    sock_laddr.to_string(),
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }

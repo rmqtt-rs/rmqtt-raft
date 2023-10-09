@@ -1,33 +1,30 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bincode::serialize;
 use futures::channel::oneshot;
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 
 use log::{info, warn};
-use once_cell::sync::Lazy;
 use prost::Message as _;
 use tikv_raft::eraftpb::{self, ConfChange};
 use tokio::time::timeout;
 
 use rust_box::collections::PriorityQueue;
-use rust_box::handy_grpc::server::{run as grpc_run, Message as GrpcMessage};
+use rust_box::handy_grpc::server::run as grpc_run;
 use rust_box::handy_grpc::transferpb;
 use rust_box::handy_grpc::Priority;
 use rust_box::mpsc::with_priority_channel;
 
 use super::message::PriorityQueueType;
 use super::message::RaftMessage;
-use super::message::{Message, RaftResponse};
-use super::message::{Receiver, Sender};
+use super::message::Sender;
+use super::message::{Message, RaftResponse, ServerGrpcMessage};
 use super::{error, Config};
 
 #[derive(Clone)]
 pub struct RaftServer {
-    channel_queue: PriorityQueueType<Priority, GrpcMessage>,
+    pub(crate) channel_queue: PriorityQueueType<Priority, ServerGrpcMessage>,
     snd: Sender<(Priority, Message)>,
     laddr: SocketAddr,
     timeout: Duration,
@@ -46,18 +43,15 @@ impl RaftServer {
         }
     }
 
-    #[inline]
-    pub fn channel_queue_len(&self) -> usize {
-        self.channel_queue.read().len()
-    }
-
     pub async fn run(&self) -> error::Result<()> {
         let laddr = self.laddr;
         let _cfg = self.cfg.clone();
         info!("listening gRPC requests on: {}", laddr);
 
-        let (tx, mut rx) =
-            with_priority_channel::<Priority, GrpcMessage>(self.channel_queue.clone(), 10_000);
+        let (tx, mut rx) = with_priority_channel::<Priority, ServerGrpcMessage>(
+            self.channel_queue.clone(),
+            10_000,
+        );
 
         let run_receiver_fut = async move {
             loop {
@@ -115,7 +109,7 @@ impl RaftServer {
                         Ok(RaftMessage::Status) => {
                             unreachable!()
                         }
-                        Ok(RaftMessage::ReportUnreachable { node_id }) => {
+                        _ => {
                             unreachable!()
                         }
                     }
@@ -307,18 +301,4 @@ impl RaftServer {
             log::error!("send reply message error, {:?}", e);
         }
     }
-}
-
-static SEND_PROPOSAL_ACTIVE_REQUESTS: Lazy<Arc<AtomicIsize>> =
-    Lazy::new(|| Arc::new(AtomicIsize::new(0)));
-
-static SEND_MESSAGE_ACTIVE_REQUESTS: Lazy<Arc<AtomicIsize>> =
-    Lazy::new(|| Arc::new(AtomicIsize::new(0)));
-
-pub fn send_proposal_active_requests() -> isize {
-    SEND_PROPOSAL_ACTIVE_REQUESTS.load(Ordering::SeqCst)
-}
-
-pub fn send_message_active_requests() -> isize {
-    SEND_MESSAGE_ACTIVE_REQUESTS.load(Ordering::SeqCst)
 }

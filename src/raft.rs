@@ -7,17 +7,13 @@ use async_trait::async_trait;
 use bincode::{deserialize, serialize};
 use futures::channel::oneshot;
 use futures::future::FutureExt;
-use futures::SinkExt;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
-use prost::Message as _;
 use tikv_raft::eraftpb::{ConfChange, ConfChangeType};
 use tokio::time::timeout;
 
 use rust_box::collections::PriorityQueue;
-use rust_box::handy_grpc::client::{
-    Client as GrpcClient, Mailbox as GrpcMailbox, Message as GrpcMessage,
-};
+use rust_box::handy_grpc::client::{Client as GrpcClient, Message as GrpcMessage};
 use rust_box::handy_grpc::Priority;
 use rust_box::mpsc::with_priority_channel;
 
@@ -284,8 +280,7 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             .ok_or_else(|| Error::from("None"))?;
         let channel_queue = Arc::new(parking_lot::RwLock::new(PriorityQueue::default()));
         //let (tx, rx) = mpsc::channel(100_000);
-        let (tx, mut rx) =
-            with_priority_channel::<Priority, Message>(channel_queue.clone(), 10_000);
+        let (tx, rx) = with_priority_channel::<Priority, Message>(channel_queue.clone(), 10_000);
         let cfg = Arc::new(cfg);
         Ok(Self {
             store,
@@ -308,6 +303,11 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             grpc_breaker_threshold: self.cfg.grpc_breaker_threshold,
             grpc_breaker_retry_interval: self.cfg.grpc_breaker_retry_interval.as_millis() as i64,
         }
+    }
+
+    /// Returns channel queue len
+    pub fn channel_queue_len(&self) -> usize {
+        self.channel_queue.read().len()
     }
 
     /// find leader id and leader address
@@ -369,16 +369,19 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
     /// Create a new leader for the cluster, with id 1. There has to be exactly one node in the
     /// cluster that is initialised that way
     pub async fn lead(self, node_id: u64) -> Result<()> {
+        let server = RaftServer::new(self.tx.clone(), self.addr, self.cfg.clone());
+
         let node = RaftNode::new_leader(
+            self.channel_queue.clone(),
             self.rx,
-            self.tx.clone(),
+            self.tx,
             node_id,
             self.store,
             &self.logger,
             self.cfg.clone(),
+            server.channel_queue.clone(),
         )?;
 
-        let server = RaftServer::new(self.tx, self.addr, self.cfg.clone());
         let server_handle = async {
             if let Err(e) = server.run().await {
                 warn!("raft server run error: {:?}", e);
@@ -418,18 +421,21 @@ impl<S: Store + Send + Sync + 'static> Raft<S> {
             Self::request_leader(leader_addr, self.cfg.grpc_timeout).await?
         };
 
+        let server = RaftServer::new(self.tx.clone(), self.addr, self.cfg.clone());
+
         // 2. run server and node to prepare for joining
         let mut node = RaftNode::new_follower(
+            self.channel_queue.clone(),
             self.rx,
-            self.tx.clone(),
+            self.tx,
             node_id,
             self.store,
             &self.logger,
             self.cfg.clone(),
+            server.channel_queue.clone(),
         )?;
         let peer = node.add_peer(&leader_addr, leader_id);
-        //let mut client = peer.client().await?;
-        let server = RaftServer::new(self.tx, self.addr, self.cfg.clone());
+
         let server_handle = async {
             if let Err(e) = server.run().await {
                 warn!("raft server run error: {:?}", e);

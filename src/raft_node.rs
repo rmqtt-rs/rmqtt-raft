@@ -14,17 +14,17 @@ use tikv_raft::{prelude::*, raw_node::RawNode, Config as RaftConfig};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use rust_box::handy_grpc::client::{
-    Client as GrpcClient, Mailbox as GrpcMailbox, Message as GrpcMessage,
-};
+use rust_box::handy_grpc::client::{Client as GrpcClient, Mailbox as GrpcMailbox};
 use rust_box::handy_grpc::Priority;
 
 use crate::error::{Error, Result};
-use crate::message::{Merger, Message, Proposals, RaftMessage, RaftResponse, ReplyChan, Status};
+use crate::message::{
+    GrpcMessage, Merger, Message, PriorityQueueType, Proposals, RaftMessage, RaftResponse,
+    ReplyChan, ServerGrpcMessage, Status,
+};
 use crate::message::{Receiver, Sender};
 use crate::raft::Store;
 use crate::raft::{active_mailbox_querys, active_mailbox_sends};
-use crate::raft_server::{send_message_active_requests, send_proposal_active_requests};
 use crate::storage::{LogStore, MemStorage};
 use crate::Config;
 
@@ -83,7 +83,6 @@ struct QuerySender {
     query: Vec<u8>,
     client: Peer,
     chan: oneshot::Sender<RaftResponse>,
-    max_retries: usize,
     timeout: Duration,
 }
 
@@ -353,16 +352,20 @@ pub struct RaftNode<S: Store> {
     last_snap_time: Instant,
     request_votes: usize,
     cfg: Arc<Config>,
+    node_channel_queue: PriorityQueueType<Priority, Message>,
+    server_channel_queue: PriorityQueueType<Priority, ServerGrpcMessage>,
 }
 
 impl<S: Store + 'static> RaftNode<S> {
     pub fn new_leader(
+        node_channel_queue: PriorityQueueType<Priority, Message>,
         rcv: Receiver<(Priority, Message)>,
         snd: Sender<(Priority, Message)>,
         id: u64,
         store: S,
         logger: &slog::Logger,
         cfg: Arc<Config>,
+        server_channel_queue: PriorityQueueType<Priority, ServerGrpcMessage>,
     ) -> Result<Self> {
         let config = Self::new_config(id, &cfg.raft_cfg);
         config.validate()?;
@@ -400,17 +403,21 @@ impl<S: Store + 'static> RaftNode<S> {
             last_snap_time,
             request_votes: 0,
             cfg,
+            server_channel_queue,
+            node_channel_queue,
         };
         Ok(node)
     }
 
     pub fn new_follower(
+        node_channel_queue: PriorityQueueType<Priority, Message>,
         rcv: Receiver<(Priority, Message)>,
         snd: Sender<(Priority, Message)>,
         id: u64,
         store: S,
         logger: &slog::Logger,
         cfg: Arc<Config>,
+        server_channel_queue: PriorityQueueType<Priority, ServerGrpcMessage>,
     ) -> Result<Self> {
         let config = Self::new_config(id, &cfg.raft_cfg);
         config.validate()?;
@@ -435,6 +442,8 @@ impl<S: Store + 'static> RaftNode<S> {
             last_snap_time,
             request_votes: 0,
             cfg,
+            server_channel_queue,
+            node_channel_queue,
         })
     }
 
@@ -501,15 +510,17 @@ impl<S: Store + 'static> RaftNode<S> {
     fn status(&self) -> Status {
         debug!("raft status.ss: {:?}", self.inner.status().ss);
         let leader_id = self.raft.leader_id;
+        let node_channel_queues = self.node_channel_queue.read().len();
+        let server_channel_queues = self.server_channel_queue.read().len();
         Status {
             id: self.inner.raft.id,
             leader_id,
             uncommitteds: self.uncommitteds.len(),
             request_votes: self.request_votes,
+            node_channel_queues,
+            server_channel_queues,
             active_mailbox_sends: active_mailbox_sends(),
             active_mailbox_querys: active_mailbox_querys(),
-            active_send_proposal_grpc_requests: send_proposal_active_requests(),
-            active_send_message_grpc_requests: send_message_active_requests(),
             peers: self.peer_addrs(),
         }
     }
@@ -539,7 +550,6 @@ impl<S: Store + 'static> RaftNode<S> {
             client: peer,
             chan,
             timeout: Duration::from_millis(1000),
-            max_retries: 0,
         };
         tokio::spawn(query_sender.send());
     }
@@ -596,6 +606,7 @@ impl<S: Store + 'static> RaftNode<S> {
     #[inline]
     fn take_and_propose(&mut self, merger: &mut Merger) {
         if let Some((data, reply_chans)) = merger.take() {
+            log::debug!("take_and_propose data batchs:{}", data.len());
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
             self.uncommitteds.insert(seq, reply_chans);
             let seq = serialize(&seq).unwrap();
@@ -660,7 +671,7 @@ impl<S: Store + 'static> RaftNode<S> {
                     }
 
                     if !snapshot_received && msg_type == MessageType::MsgHeartbeat {
-                        info!(
+                        debug!(
                             "raft message, snapshot_received: {}, has_leader: {}, {:?}",
                             snapshot_received,
                             self.has_leader(),
@@ -752,7 +763,7 @@ impl<S: Store + 'static> RaftNode<S> {
                 );
                 return Err(e);
             }
-            if on_ready_now.elapsed() > Duration::from_millis(200) {
+            if on_ready_now.elapsed() > Duration::from_millis(500) {
                 warn!("raft on_ready(..) elapsed: {:?}", on_ready_now.elapsed());
             }
         }
@@ -796,19 +807,21 @@ impl<S: Store + 'static> RaftNode<S> {
             // Send out the persisted messages come from the node.
             self.send_messages(ready.take_persisted_messages());
         }
+
         let mut light_rd = self.advance(ready);
 
         if let Some(commit) = light_rd.commit_index() {
             let store = self.mut_store();
             store.set_hard_state_comit(commit)?;
         }
+
         // Send out the messages.
         self.send_messages(light_rd.take_messages());
+
         // Apply all committed entries.
         self.handle_committed_entries(light_rd.take_committed_entries())
             .await?;
         self.advance_apply();
-
         Ok(())
     }
 
@@ -912,7 +925,6 @@ impl<S: Store + 'static> RaftNode<S> {
             seq,
             self.uncommitteds.len()
         );
-
         match (
             deserialize::<Proposals>(entry.get_data())?,
             self.uncommitteds.remove(&seq),
@@ -920,7 +932,7 @@ impl<S: Store + 'static> RaftNode<S> {
             (Proposals::One(data), chan) => {
                 let apply_start = std::time::Instant::now();
                 let reply = self.store.apply(&data).await;
-                if apply_start.elapsed().as_secs() > 3 {
+                if apply_start.elapsed().as_millis() > 100 {
                     log::warn!("apply, cost time: {:?}", apply_start.elapsed());
                 }
                 if let Some(ReplyChan::One((chan, inst))) = chan {
@@ -946,7 +958,7 @@ impl<S: Store + 'static> RaftNode<S> {
                 while let Some(data) = datas.pop() {
                     let apply_start = std::time::Instant::now();
                     let reply = self.store.apply(&data).await;
-                    if apply_start.elapsed().as_secs() > 3 {
+                    if apply_start.elapsed().as_millis() > 100 {
                         log::warn!("apply, cost time: {:?}", apply_start.elapsed());
                     }
                     if let Some((chan, inst)) = chans.as_mut().and_then(|cs| cs.pop()) {
@@ -991,6 +1003,7 @@ impl<S: Store + 'static> RaftNode<S> {
                 result
             );
         }
+
         Ok(())
     }
 }

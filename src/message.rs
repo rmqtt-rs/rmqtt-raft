@@ -12,6 +12,9 @@ pub(crate) type Sender<T> = rust_box::mpsc::Sender<T, rust_box::mpsc::SendError<
 pub(crate) type Receiver<T> = rust_box::mpsc::Receiver<T>;
 pub(crate) type PriorityQueueType<P, T> = Arc<parking_lot::RwLock<PriorityQueue<P, T>>>;
 
+pub(crate) use rust_box::handy_grpc::client::Message as GrpcMessage;
+pub(crate) use rust_box::handy_grpc::server::Message as ServerGrpcMessage;
+
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize, Debug)]
 pub enum RaftMessage {
@@ -113,10 +116,10 @@ pub struct Status {
     pub leader_id: u64,
     pub uncommitteds: usize,
     pub request_votes: usize,
+    pub node_channel_queues: usize,
+    pub server_channel_queues: usize,
     pub active_mailbox_sends: isize,
     pub active_mailbox_querys: isize,
-    pub active_send_proposal_grpc_requests: isize,
-    pub active_send_message_grpc_requests: isize,
     pub peers: HashMap<u64, String>,
 }
 
@@ -143,6 +146,15 @@ pub(crate) enum Proposals {
     More(Vec<Vec<u8>>),
 }
 
+impl Proposals {
+    pub fn len(&self) -> usize {
+        match self {
+            Proposals::One(_) => 1,
+            Proposals::More(more) => more.len(),
+        }
+    }
+}
+
 pub(crate) struct Merger {
     proposals: Vec<Vec<u8>>,
     chans: Vec<(oneshot::Sender<RaftResponse>, Instant)>,
@@ -153,6 +165,11 @@ pub(crate) struct Merger {
 
 impl Merger {
     pub fn new(proposal_batch_size: usize, proposal_batch_timeout: Duration) -> Self {
+        log::info!(
+            "proposal_batch_size: {:?}, proposal_batch_timeout: {:?}",
+            proposal_batch_size,
+            proposal_batch_timeout
+        );
         Self {
             proposals: Vec::new(),
             chans: Vec::new(),

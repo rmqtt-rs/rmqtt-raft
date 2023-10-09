@@ -6,17 +6,17 @@ extern crate slog_term;
 use async_trait::async_trait;
 use bincode::{deserialize, serialize};
 use rmqtt_raft::{Config, Mailbox, Raft, Result as RaftResult, Store};
+use scc::HashMap;
 use serde::{Deserialize, Serialize};
 use slog::{info, Level};
 use slog::{Drain, Record};
 use slog_term::{CountingWriter, RecordDecorator, ThreadSafeTimestampFn};
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use structopt::StructOpt;
 use warp::{reply, Filter};
@@ -40,14 +40,14 @@ pub enum Message {
 }
 
 #[derive(Clone)]
-struct HashStore(Arc<RwLock<HashMap<String, String>>>);
+struct HashStore(Arc<HashMap<String, String>>);
 
 impl HashStore {
     fn new() -> Self {
-        Self(Arc::new(RwLock::new(HashMap::new())))
+        Self(Arc::new(HashMap::new()))
     }
-    fn get(&self, key: &str) -> Option<String> {
-        self.0.read().unwrap().get(key).cloned()
+    async fn get(&self, key: &str) -> Option<String> {
+        self.0.get_async(key).await.map(|item| item.get().clone())
     }
 }
 
@@ -57,14 +57,13 @@ impl Store for HashStore {
         let message: Message = deserialize(message).unwrap();
         let message: Vec<u8> = match message {
             Message::Insert { key, value } => {
-                let mut db = self.0.write().unwrap();
                 let v = serialize(&value).unwrap();
-                db.insert(key, value);
+                let _ = self.0.insert_async(key, value).await;
                 v
             }
             _ => Vec::new(),
         };
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        //tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         Ok(message)
     }
 
@@ -72,7 +71,7 @@ impl Store for HashStore {
         let query: Message = deserialize(query).unwrap();
         let data: Vec<u8> = match query {
             Message::Get { key } => {
-                if let Some(val) = self.get(&key) {
+                if let Some(val) = self.get(&key).await {
                     serialize(&val).unwrap()
                 } else {
                     Vec::new()
@@ -84,13 +83,14 @@ impl Store for HashStore {
     }
 
     async fn snapshot(&self) -> RaftResult<Vec<u8>> {
-        Ok(serialize(&self.0.read().unwrap().clone())?)
+        Ok(serialize(self.0.as_ref())?)
     }
 
     async fn restore(&mut self, snapshot: &[u8]) -> RaftResult<()> {
         let new: HashMap<String, String> = deserialize(snapshot).unwrap();
-        let mut db = self.0.write().unwrap();
-        let _ = std::mem::replace(&mut *db, new);
+        //let mut db = self.0;
+        //let _ = std::mem::replace(&mut *db, new);
+        self.0 = Arc::new(new);
         Ok(())
     }
 }
@@ -123,7 +123,7 @@ async fn put(
 }
 
 async fn get(store: HashStore, key: String) -> Result<impl warp::Reply, Infallible> {
-    let response = store.get(&key);
+    let response = store.get(&key).await;
     Ok(reply::json(&response))
 }
 
@@ -189,11 +189,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let cfg = Config {
         reuseaddr: true,
         reuseport: true,
-        grpc_timeout: Duration::from_secs(6),
-        grpc_concurrency_limit: 200,
-        proposal_batch_size: 50,
+        grpc_timeout: Duration::from_secs(10),
+        grpc_concurrency_limit: 500,
+        proposal_batch_size: 200,
+        proposal_batch_timeout: Duration::from_millis(200),
         ..Default::default()
     };
+    info!(
+        logger,
+        "config proposal_batch_size: {:?}", cfg.proposal_batch_size
+    );
     let raft = Raft::new(options.raft_laddr, store.clone(), logger.clone(), cfg)?;
     let leader_info = raft.find_leader_info(options.peer_addrs).await?;
     info!(logger, "leader_info: {:?}", leader_info);
